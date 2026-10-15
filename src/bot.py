@@ -389,7 +389,7 @@ class League:
 
         # Prefer rostered players, then highest OVR.
         matches = sorted(matches, key=lambda m: (m["tid"] < 0, -(m["ratings"]["ovr"] or 0)))
-        card = self.card(matches[0])
+        card = f"```\n{self.card(matches[0])}\n```"
         if len(matches) > 1:
             card += f"\n_(+{len(matches) - 1} other player(s) with this name)_"
         return card
