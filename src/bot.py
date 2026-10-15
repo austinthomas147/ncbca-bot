@@ -21,6 +21,7 @@ import gzip
 import json
 import os
 import tempfile
+import time
 import unicodedata
 from collections import defaultdict
 from pathlib import Path
@@ -31,6 +32,7 @@ import ijson
 from discord.ext import commands
 
 STATE_FILE = Path(__file__).with_name("bot_state.json")
+CACHE_FILE = Path(__file__).with_name("league_cache.json")  # local copy of the last URL load
 
 CLASS_LABELS = {1: "Fr.", 2: "So.", 3: "Jr.", 4: "Sr."}
 STATUS_LABELS = {-1: "Free Agent", -2: "Recruit", -3: "Retired"}
@@ -496,48 +498,72 @@ bot = commands.Bot(
 league: League | None = None
 league_source: str | None = None
 load_lock = asyncio.Lock()
+autoload_task: asyncio.Task | None = None
 
 
 async def download(url: str) -> str:
-    """Stream a URL to a temp file so large exports never sit fully in memory."""
-    fd, tmp = tempfile.mkstemp(suffix=".json")
+    """Stream a URL to a temp file next to the bot (same disk as the cache,
+    so it can be renamed into place) without holding it in memory."""
+    fd, tmp = tempfile.mkstemp(suffix=".json", dir=CACHE_FILE.parent)
     os.close(fd)
     try:
-        timeout = aiohttp.ClientTimeout(total=600)
+        timeout = aiohttp.ClientTimeout(total=600, sock_connect=15, sock_read=60)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(url) as resp:
                 resp.raise_for_status()
                 with open(tmp, "wb") as f:
                     async for chunk in resp.content.iter_chunked(1 << 20):
                         f.write(chunk)
-    except Exception:
+    except BaseException:  # includes cancellation
         os.remove(tmp)
         raise
     return tmp
 
 
-async def load_source(source: str) -> League:
+async def load_source(source: str, path: str | None = None) -> League:
     """Load from a local path or http(s) URL. The old league keeps serving
-    lookups until the new one parses successfully."""
+    lookups until the new one parses successfully. URL loads are kept as
+    league_cache.json so restarts don't depend on the link still working."""
     global league, league_source
     is_url = source.lower().startswith(("http://", "https://"))
-    path = await download(source) if is_url else os.path.expanduser(source)
+    fresh_download = path is None and is_url
+    if path is None:
+        path = await download(source) if is_url else os.path.expanduser(source)
+    t0 = time.monotonic()
     try:
         new = await asyncio.to_thread(League, path)
-    finally:
-        if is_url:
+    except BaseException:
+        if fresh_download:
             os.remove(path)
+        raise
     if not new.count:
+        if fresh_download:
+            os.remove(path)
         raise ValueError("no players found. Is this a BBGM export?")
+    if fresh_download:
+        os.replace(path, CACHE_FILE)
+    print(f"Parsed {new.count} players (season {new.season}) in {time.monotonic() - t0:.1f}s")
     league, league_source = new, source
     STATE_FILE.write_text(json.dumps({"source": source}))
     return new
 
 
-async def run_load(ctx, source: str):
+async def cancel_autoload():
+    """A manual load takes priority over the startup restore."""
+    if autoload_task and not autoload_task.done():
+        autoload_task.cancel()
+        try:
+            await autoload_task
+        except asyncio.CancelledError:
+            pass
+
+
+async def run_load(ctx, source: str | None = None):
+    await cancel_autoload()
     if load_lock.locked():
         return await ctx.send("A load is already in progress.")
     async with load_lock:
+        source = source or league_source
         msg = await ctx.send("Loading export…")
         try:
             new = await load_source(source)
@@ -547,21 +573,32 @@ async def run_load(ctx, source: str):
 
 
 async def autoload():
-    """On startup, reload whatever was last loaded."""
+    """On startup, restore the last league: from the local cache for URL
+    loads, or from the original path for file loads."""
+    global league_source
     try:
         source = json.loads(STATE_FILE.read_text())["source"]
     except (FileNotFoundError, KeyError, ValueError):
+        print("No saved league; waiting for `pls load`.")
         return
+    league_source = source  # so `pls reload` works even if the restore fails
+    is_url = source.lower().startswith(("http://", "https://"))
+    path = str(CACHE_FILE) if is_url and CACHE_FILE.exists() else None
+    print(f"Restoring last league from {path or source}…")
     async with load_lock:
         try:
-            new = await load_source(source)
-            print(f"Autoloaded {new.count} players (season {new.season}) from {source}")
+            await load_source(source, path)
+        except asyncio.CancelledError:
+            print("Startup restore cancelled by a manual load.")
+            raise
         except Exception as e:
-            print(f"Autoload of {source} failed: {e}")
+            print(f"Startup restore failed: {type(e).__name__}: {e}")
 
 
 async def setup_hook():
-    asyncio.create_task(autoload())  # don't block login on a big parse
+    global autoload_task
+    print(f"ijson backend: {ijson.backend}")  # 'python' here means slow parsing
+    autoload_task = asyncio.create_task(autoload())  # don't block login on a big parse
 
 bot.setup_hook = setup_hook
 
@@ -573,18 +610,14 @@ async def on_ready():
 
 @bot.command(name="player")
 async def player_cmd(ctx, *, name: str):
-    if league is None:
-        msg = "League is still loading, try again shortly." if load_lock.locked() \
-            else "No league loaded yet. Use `pls load <path or URL>`."
+    if msg := not_ready():
         return await ctx.send(msg)
     await ctx.send(league.lookup(name))
 
 
 @bot.command(name="team")
 async def team_cmd(ctx, *, name: str):
-    if league is None:
-        msg = "League is still loading, try again shortly." if load_lock.locked() \
-            else "No league loaded yet. Use `pls load <path or URL>`."
+    if msg := not_ready():
         return await ctx.send(msg)
     for chunk in league.team_lookup(name):
         await ctx.send(chunk)
@@ -593,8 +626,11 @@ async def team_cmd(ctx, *, name: str):
 def not_ready():
     if league is not None:
         return None
-    return ("League is still loading, try again shortly." if load_lock.locked()
-            else "No league loaded yet. Use `pls load <path or URL>`.")
+    if autoload_task and not autoload_task.done():
+        return "Restoring the last league after a restart, try again shortly."
+    if load_lock.locked():
+        return "League is still loading, try again shortly."
+    return "No league loaded yet. Use `pls load <path or URL>`."
 
 
 @bot.command(name="log", aliases=["results"])
@@ -615,9 +651,7 @@ async def schedule_cmd(ctx, *, name: str):
 
 @bot.command(name="leaders", aliases=["leader", "top"])
 async def leaders_cmd(ctx, stat: str = None, n: int = 10):
-    if league is None:
-        msg = "League is still loading, try again shortly." if load_lock.locked() \
-            else "No league loaded yet. Use `pls load <path or URL>`."
+    if msg := not_ready():
         return await ctx.send(msg)
     if stat is None:
         return await ctx.send("Usage: `pls leaders <stat> [count]`\nStats: " + ", ".join(LEADER_STATS))
@@ -660,7 +694,7 @@ async def load_cmd(ctx, *, source: str):
 async def reload_cmd(ctx):
     if not league_source:
         return await ctx.send("Nothing loaded yet. Use `pls load <path or URL>`.")
-    await run_load(ctx, league_source)
+    await run_load(ctx)
 
 
 USAGE = {
