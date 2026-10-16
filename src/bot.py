@@ -2,7 +2,7 @@
 BBGM player-card Discord bot.
 
 Discord usage:
-    pls player FirstName LastName
+    pls player FirstName LastName [, Team | #N]
     pls team Drake           roster + record (region, name, abbrev, or "Drake Bulldogs")
     pls log Drake            this season's results
     pls schedule Drake       remaining games
@@ -20,6 +20,7 @@ import difflib
 import gzip
 import json
 import os
+import re
 import tempfile
 import time
 import unicodedata
@@ -99,7 +100,7 @@ COUNTING = ["gp", "min", "fg", "fga", "tp", "tpa", "ft", "fta",
             "orb", "drb", "ast", "stl", "blk", "tov", "pts", "ewa"]
 MIN_WEIGHTED = ["per", "ortg", "drtg"]  # rate stats, weighted by minutes across stints
 RATING_KEYS = ["hgt", "stre", "spd", "jmp", "endu", "ins", "dnk", "ft", "fg", "tp",
-               "oiq", "diq", "drb", "pss", "reb", "ovr", "pos", "season"]
+               "oiq", "diq", "drb", "pss", "reb", "ovr", "pos", "season", "skills"]
 
 
 # ---------------------------------------------------------------- loading
@@ -381,20 +382,53 @@ class League:
     # ------------------------------------------------------------ lookup
 
     def lookup(self, query: str) -> str:
-        matches = self.players.get(norm(query))
+        """`Name`, `Name, Team`, or `Name #2` (pick from the duplicates list)."""
+        pick = None
+        m = re.search(r"\s*#(\d+)\s*$", query)
+        if m:
+            pick, query = int(m.group(1)), query[:m.start()]
+        name, _, team_q = query.partition(",")
+        name, team_q = name.strip(), team_q.strip()
+
+        matches = self.players.get(norm(name))
         if not matches:
-            close = difflib.get_close_matches(norm(query), self.players.keys(), n=3, cutoff=0.75)
+            close = difflib.get_close_matches(norm(name), self.players.keys(), n=3, cutoff=0.75)
             if close:
                 names = ", ".join(self.players[k][0]["name"] for k in close)
-                return f"No player named **{query}**. Did you mean: {names}?"
-            return f"No player named **{query}**."
+                return f"No player named **{name}**. Did you mean: {names}?"
+            return f"No player named **{name}**."
 
-        # Prefer rostered players, then highest OVR.
+        # Rostered first, then highest OVR. This order also defines the #N picks.
         matches = sorted(matches, key=lambda m: (m["tid"] < 0, -(m["ratings"]["ovr"] or 0)))
-        card = f"```\n{self.card(matches[0])}\n```"
-        if len(matches) > 1:
-            card += f"\n_(+{len(matches) - 1} other player(s) with this name)_"
-        return card
+
+        if team_q:
+            tid, err = self.resolve_team(team_q)
+            if err:
+                return err
+            matches = [p for p in matches if p["tid"] == tid]
+            if not matches:
+                return f"No **{name}** on {self.team_label(tid)}."
+
+        if pick is not None:
+            if not 1 <= pick <= len(matches):
+                return f"There are only {len(matches)} players named **{name}**."
+            return f"```\n{self.card(matches[pick - 1])}\n```"
+
+        if len(matches) == 1:
+            return f"```\n{self.card(matches[0])}\n```"
+
+        # Several with this name: list them instead of guessing.
+        rows = []
+        for i, p in enumerate(matches, 1):
+            r = p["ratings"]
+            team = (self.team_label(p["tid"]) if p["tid"] >= 0
+                    else STATUS_LABELS.get(p["tid"], "?"))
+            bits = [team, r.get("pos"), class_label(p), f"{int(r['ovr'] or 0)} OVR"]
+            rows.append(f"{i}. " + " | ".join(b for b in bits if b))
+        return (f"{len(matches)} players named **{matches[0]['name']}**:\n"
+                + "```\n" + "\n".join(rows) + "\n```\n"
+                + f"Use `pls player {matches[0]['name']} #N` or "
+                  f"`pls player {matches[0]['name']}, Team`.")
 
     # ------------------------------------------------------------ leaders
 
@@ -436,7 +470,8 @@ class League:
             team = STATUS_LABELS.get(p["tid"], "?")
             cls = None
 
-        header = [p["name"], f"{num(r['ovr'])} OVR", cls, r.get("pos"), team]
+        jersey = f"#{p['jersey']}" if p["jersey"] not in (None, "") else None
+        header = [p["name"], f"{num(r['ovr'])} OVR", cls, r.get("pos"), jersey, team]
         lines = [" | ".join(x for x in header if x)]
         origin = [x for x in (p["loc"], p["college"]) if x]
         if origin:
@@ -469,8 +504,8 @@ class League:
             size.append(f"{hgt // 12}'{hgt % 12}\"")
         if p["weight"]:
             size.append(f"{num(p['weight'])} LB")
-        if p["jersey"] not in (None, ""):
-            size.append(str(p["jersey"]))
+        if r.get("skills"):  # BBGM badges, e.g. ["3", "A", "Ps"]
+            size.append(" ".join(r["skills"]))
 
         g = lambda k: num(r.get(k))
         lines += [
@@ -660,6 +695,7 @@ async def leaders_cmd(ctx, stat: str = None, n: int = 10):
 
 HELP_TEXT = """**BBGM Bot commands**
 `pls player <First Last>`: player card with this season's stats and ratings
+  Same name? Add `, Team` or `#N`: `pls player John Smith, Drake`
 `pls team <name>`: record and roster (region, nickname, or abbreviation)
 `pls log <team>`: this season's results
 `pls schedule <team>`: remaining games
@@ -698,7 +734,7 @@ async def reload_cmd(ctx):
 
 
 USAGE = {
-    "player": "pls player FirstName LastName",
+    "player": "pls player FirstName LastName [, Team | #N]",
     "team": "pls team TeamName",
     "leaders": "pls leaders <stat> [count]",
     "log": "pls log TeamName",
