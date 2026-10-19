@@ -3,7 +3,7 @@ BBGM player-card Discord bot.
 
 Discord usage:
     pls player FirstName LastName [YEAR] [, Team | #N]
-    pls team Drake           roster + record (region, name, abbrev, or "Drake Bulldogs")
+    pls team Drake [YEAR]    roster + record (region, name, abbrev, or "Drake Bulldogs")
     pls log Drake            this season's results
     pls schedule Drake       remaining games
     pls leaders pts [N]      top N (default 10, max 25) in a stat; `pls leaders` lists stats
@@ -254,17 +254,19 @@ class League:
             ga = {a["key"]: a["value"] for a in ga}
         self.season = ga.get("season")
 
-        self.teams, self.records = {}, {}
+        self.teams = {}
+        self.season_records = defaultdict(dict)  # season -> tid -> "W-L"
         for t in _stream(path, "teams.item"):
             tid = int(t["tid"])
             self.teams[tid] = {k: t.get(k) for k in ("region", "name", "abbrev")}
             for s in t.get("seasons") or []:  # older exports nest seasons in teams
-                if s.get("season") == self.season:
-                    self.records[tid] = format_record(s)
-        if not self.records:  # newer exports keep them in a top-level teamSeasons
+                if s.get("season") is not None:
+                    self.season_records[s["season"]][tid] = format_record(s)
+        if not self.season_records:  # newer exports keep them in a top-level teamSeasons
             for s in _stream(path, "teamSeasons.item"):
-                if s.get("season") == self.season:
-                    self.records[int(s["tid"])] = format_record(s)
+                if s.get("season") is not None:
+                    self.season_records[s["season"]][int(s["tid"])] = format_record(s)
+        self.records = self.season_records.get(self.season, {})
 
         # Played games: keep only score lines, not box scores.
         self.games = defaultdict(list)
@@ -335,12 +337,23 @@ class League:
         return next(iter(tids)), None
 
     def team_lookup(self, query: str) -> list[str]:
+        """`Team` or `Team YEAR` for a past season's roster."""
+        year = None
+        m = re.search(r"(?<![#\w])(\d{4})(?!\w)", query)
+        if m:
+            year, query = int(m.group(1)), (query[:m.start()] + " " + query[m.end():]).strip()
         tid, err = self.resolve_team(query)
-        return [err] if err else self.team_card(tid)
+        if err:
+            return [err]
+        if year is None or year == self.season:
+            return self.team_card(tid)
+        return self.past_team_card(tid, year)
 
-    def team_title(self, tid):
-        title = f"{self.season} {self.team_label(tid)}"
-        return f"{title}: {self.records[tid]}" if tid in self.records else title
+    def team_title(self, tid, year=None):
+        year = self.season if year is None else year
+        title = f"{year} {self.team_label(tid)}"
+        rec = self.season_records.get(year, {}).get(tid)
+        return f"{title}: {rec}" if rec else title
 
     def opp_label(self, tid):
         rec = self.records.get(tid)
@@ -396,26 +409,46 @@ class League:
         )
         if not roster:
             return [f"{title}\nNo players on the roster."]
+        return self.roster_table(title, roster, self.season, current=True)
 
+    def past_team_card(self, tid, year) -> list[str]:
+        """Roster as of a past season: everyone whose last stint that year was here."""
+        title = self.team_title(tid, year)
+        roster = [v for recs in self.players.values() for p in recs
+                  if p["history"].get(year, {}).get("tid") == tid
+                  and (v := season_view(p, year, self.season))]
+        if not roster:
+            if year in self.season_records:
+                return [f"```\n{title}\nNo player stats on record for {year}.\n```"]
+            return [f"No {year} season in this export."]
+        roster.sort(key=lambda p: (-(p["stats"]["min"] if p["stats"] else 0),
+                                   -(p["ratings"]["ovr"] or 0)))
+        return self.roster_table(title, roster, year, current=False)
+
+    def roster_table(self, title, roster, season, current) -> list[str]:
+        """Injury and playing time only exist for the current season."""
         rows = []
         for i, p in enumerate(roster, 1):
             r, t = p["ratings"], p["stats"]
-            row = [str(i), p["name"], str(p["injury"] or ""), r.get("pos") or "",
-                   class_label(p) or "", str(int(r["ovr"] or 0))]
-            if t and t["gp"] and p["stat_season"] == self.season:
+            ovr = "?" if r["ovr"] is None else str(int(r["ovr"]))
+            row = [str(i), p["name"], str(p["injury"] or "") if current else None,
+                   r.get("pos") or "", class_label(p) or "", ovr]
+            if t and t["gp"] and p["stat_season"] == season:
                 gp = t["gp"]
                 row += [str(int(gp)), str(int(t["gs"])), f"{t['min'] / gp:.1f}", f"{t['pts'] / gp:.1f}",
                         f"{(t['orb'] + t['drb']) / gp:.1f}", f"{t['ast'] / gp:.1f}",
                         f"{t['per']:.1f}"]
             else:
                 row += ["0", "0", "", "", "", "", ""]
-            row.append(PT_LABELS.get(p["pt"], str(p["pt"])))
-            rows.append(row)
+            row.append(PT_LABELS.get(p["pt"], str(p["pt"])) if current else None)
+            rows.append([c for c in row if c is not None])
 
         header = ["#", "Name", "Inj", "Pos", "Yr", "Ovr", "GP", "GS", "Min", "Pts", "Reb", "Ast", "PER", "PT"]
+        if not current:
+            header = [h for h in header if h not in ("Inj", "PT")]
         widths = [max(len(x[c]) for x in rows + [header]) for c in range(len(header))]
         line = lambda cells: " ".join(
-            c.ljust(w) if j == len(header) - 1 else c.rjust(w)
+            c.ljust(w) if header[j] == "PT" else c.rjust(w)
             for j, (c, w) in enumerate(zip(cells, widths))
         ).rstrip()
         lines = [line(header)] + [line(r) for r in rows]
@@ -754,7 +787,8 @@ HELP_TEXT = """**BBGM Bot commands**
 `pls player <First Last> [year]`: player card with this season's stats and ratings
   Add a year for a past season: `pls player John Smith 2025`
   Same name? Add `, Team` or `#N`: `pls player John Smith, Drake`
-`pls team <name>`: record and roster (region, nickname, or abbreviation)
+`pls team <name> [year]`: record and roster (region, nickname, or abbreviation)
+  Add a year for a past season: `pls team Drake 2025`
 `pls log <team>`: this season's results
 `pls schedule <team>`: remaining games
 `pls leaders <stat> [count]`: top players in a stat (default 10, max 25)
@@ -793,7 +827,7 @@ async def reload_cmd(ctx):
 
 USAGE = {
     "player": "pls player FirstName LastName [YEAR] [, Team | #N]",
-    "team": "pls team TeamName",
+    "team": "pls team TeamName [YEAR]",
     "leaders": "pls leaders <stat> [count]",
     "log": "pls log TeamName",
     "schedule": "pls schedule TeamName",
