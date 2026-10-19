@@ -96,7 +96,7 @@ LEADER_STATS = {
 }
 STAT_ALIASES = {a: k for k, v in LEADER_STATS.items() for a in [k, *v[4]]}
 
-COUNTING = ["gp", "min", "fg", "fga", "tp", "tpa", "ft", "fta",
+COUNTING = ["gp", "gs", "min", "fg", "fga", "tp", "tpa", "ft", "fta",
             "orb", "drb", "ast", "stl", "blk", "tov", "pts", "ewa"]
 MIN_WEIGHTED = ["per", "ortg", "drtg"]  # rate stats, weighted by minutes across stints
 RATING_KEYS = ["hgt", "stre", "spd", "jmp", "endu", "ins", "dnk", "ft", "fg", "tp",
@@ -156,7 +156,12 @@ def class_years(reg_seasons, tid, current_season):
 def class_label(p):
     if p["tid"] is None or p["tid"] < 0:
         return None
-    return CLASS_LABELS.get(p["years"], "Gr." if p["years"] > 4 else None)
+    age = p.get("age")
+    if age is not None and age <= 18:
+        return "HS"
+    if p["years"] > 4 or (age is not None and age >= 23):
+        return "LS"  # 5th-year senior
+    return CLASS_LABELS.get(p["years"])
 
 
 def format_record(s):
@@ -207,6 +212,8 @@ def summarize(p, current_season):
         "weight": p.get("weight"),
         "jersey": jersey,
         "years": class_years(seasons, tid, current_season),
+        "born_year": born.get("year"),
+        "age": current_season - born["year"] if current_season and born.get("year") else None,
         "injury": (p.get("injury") or {}).get("gamesRemaining", 0) or 0,
         "pt": p.get("ptModifier", 1),
         "roster_order": p.get("rosterOrder"),
@@ -232,6 +239,7 @@ def season_view(p, year, current_season):
         "tid": tid,  # None: no team on record that season
         "jersey": h.get("jersey") or (p["jersey"] if year == current_season else None),
         "years": class_years([s for s in p["seasons"] if s <= year], tid if tid is not None else -1, year),
+        "age": year - p["born_year"] if p["born_year"] else None,
         "ratings": h["ratings"] or {k: None for k in RATING_KEYS},
         "stat_season": year,
         "stats": h.get("stats"),
@@ -396,15 +404,15 @@ class League:
                    class_label(p) or "", str(int(r["ovr"] or 0))]
             if t and t["gp"] and p["stat_season"] == self.season:
                 gp = t["gp"]
-                row += [str(int(gp)), f"{t['min'] / gp:.1f}", f"{t['pts'] / gp:.1f}",
+                row += [str(int(gp)), str(int(t["gs"])), f"{t['min'] / gp:.1f}", f"{t['pts'] / gp:.1f}",
                         f"{(t['orb'] + t['drb']) / gp:.1f}", f"{t['ast'] / gp:.1f}",
                         f"{t['per']:.1f}"]
             else:
-                row += ["0", "", "", "", "", ""]
+                row += ["0", "0", "", "", "", "", ""]
             row.append(PT_LABELS.get(p["pt"], str(p["pt"])))
             rows.append(row)
 
-        header = ["#", "Name", "Inj", "Pos", "Yr", "Ovr", "GP", "Min", "Pts", "Reb", "Ast", "PER", "PT"]
+        header = ["#", "Name", "Inj", "Pos", "Yr", "Ovr", "GP", "GS", "Min", "Pts", "Reb", "Ast", "PER", "PT"]
         widths = [max(len(x[c]) for x in rows + [header]) for c in range(len(header))]
         line = lambda cells: " ".join(
             c.ljust(w) if j == len(header) - 1 else c.rjust(w)
