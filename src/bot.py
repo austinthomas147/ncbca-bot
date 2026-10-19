@@ -2,7 +2,7 @@
 BBGM player-card Discord bot.
 
 Discord usage:
-    pls player FirstName LastName [, Team | #N]
+    pls player FirstName LastName [YEAR] [, Team | #N]
     pls team Drake           roster + record (region, name, abbrev, or "Drake Bulldogs")
     pls log Drake            this season's results
     pls schedule Drake       remaining games
@@ -154,7 +154,7 @@ def class_years(reg_seasons, tid, current_season):
 
 
 def class_label(p):
-    if p["tid"] < 0:
+    if p["tid"] is None or p["tid"] < 0:
         return None
     return CLASS_LABELS.get(p["years"], "Gr." if p["years"] > 4 else None)
 
@@ -184,6 +184,18 @@ def summarize(p, current_season):
     if jersey is None:
         jersey = next((s["jerseyNumber"] for s in reversed(reg) if s.get("jerseyNumber")), None)
 
+    # Per-season snapshots for `pls player Name YEAR`.
+    history = {}
+    for rt in ratings:
+        if rt.get("season") is not None:
+            history[rt["season"]] = {"ratings": {k: rt.get(k) for k in RATING_KEYS}}
+    for season in seasons:
+        rows = [s for s in reg if s["season"] == season]
+        h = history.setdefault(season, {"ratings": None})
+        h["stats"] = aggregate(rows)
+        h["tid"] = int(rows[-1]["tid"])  # last stint that season
+        h["jersey"] = next((s["jerseyNumber"] for s in reversed(rows) if s.get("jerseyNumber")), None)
+
     tid = int(p.get("tid", -1))
     born = p.get("born") or {}
     return {
@@ -201,7 +213,30 @@ def summarize(p, current_season):
         "ratings": {k: r.get(k) for k in RATING_KEYS},
         "stat_season": stat_season,
         "stats": stats,
+        "seasons": seasons,
+        "history": history,
     }
+
+
+def season_view(p, year, current_season):
+    """A copy of a summarized player as of `year`, shaped like the default
+    record so card() can render it. None if they have no data that season."""
+    h = p["history"].get(year)
+    if not h:
+        return None
+    tid = h.get("tid")
+    if tid is None and year == current_season:
+        tid = p["tid"]  # rated this season but no games yet
+    v = dict(p)
+    v.update({
+        "tid": tid,  # None: no team on record that season
+        "jersey": h.get("jersey") or (p["jersey"] if year == current_season else None),
+        "years": class_years([s for s in p["seasons"] if s <= year], tid if tid is not None else -1, year),
+        "ratings": h["ratings"] or {k: None for k in RATING_KEYS},
+        "stat_season": year,
+        "stats": h.get("stats"),
+    })
+    return v
 
 
 class League:
@@ -381,12 +416,22 @@ class League:
 
     # ------------------------------------------------------------ lookup
 
+    def team_or_status(self, tid):
+        if tid is None:
+            return None
+        return self.team_label(tid) if tid >= 0 else STATUS_LABELS.get(tid, "?")
+
     def lookup(self, query: str) -> str:
-        """`Name`, `Name, Team`, or `Name #2` (pick from the duplicates list)."""
+        """`Name`, `Name, Team`, or `Name #2` (pick from the duplicates list),
+        each optionally with a 4-digit season, e.g. `Name 2025, Team`."""
         pick = None
         m = re.search(r"\s*#(\d+)\s*$", query)
         if m:
             pick, query = int(m.group(1)), query[:m.start()]
+        year = None
+        m = re.search(r"(?<![#\w])(\d{4})(?!\w)", query)
+        if m:
+            year, query = int(m.group(1)), (query[:m.start()] + " " + query[m.end():]).strip()
         name, _, team_q = query.partition(",")
         name, team_q = name.strip(), team_q.strip()
 
@@ -401,13 +446,20 @@ class League:
         # Rostered first, then highest OVR. This order also defines the #N picks.
         matches = sorted(matches, key=lambda m: (m["tid"] < 0, -(m["ratings"]["ovr"] or 0)))
 
+        if year is not None:
+            views = [season_view(p, year, self.season) for p in matches]
+            matches = [v for v in views if v]
+            if not matches:
+                return f"No **{name}** with stats or ratings in {year}."
+
         if team_q:
             tid, err = self.resolve_team(team_q)
             if err:
                 return err
             matches = [p for p in matches if p["tid"] == tid]
             if not matches:
-                return f"No **{name}** on {self.team_label(tid)}."
+                when = f" in {year}" if year is not None else ""
+                return f"No **{name}** on {self.team_label(tid)}{when}."
 
         if pick is not None:
             if not 1 <= pick <= len(matches):
@@ -421,14 +473,15 @@ class League:
         rows = []
         for i, p in enumerate(matches, 1):
             r = p["ratings"]
-            team = (self.team_label(p["tid"]) if p["tid"] >= 0
-                    else STATUS_LABELS.get(p["tid"], "?"))
-            bits = [team, r.get("pos"), class_label(p), f"{int(r['ovr'] or 0)} OVR"]
+            ovr = f"{int(r['ovr'])} OVR" if r["ovr"] is not None else None
+            bits = [self.team_or_status(p["tid"]), r.get("pos"), class_label(p), ovr]
             rows.append(f"{i}. " + " | ".join(b for b in bits if b))
-        return (f"{len(matches)} players named **{matches[0]['name']}**:\n"
+        nm, yr = matches[0]["name"], f" {year}" if year is not None else ""
+        when = f" in {year}" if year is not None else ""
+        return (f"{len(matches)} players named **{nm}**{when}:\n"
                 + "```\n" + "\n".join(rows) + "\n```\n"
-                + f"Use `pls player {matches[0]['name']} #N` or "
-                  f"`pls player {matches[0]['name']}, Team`.")
+                + f"Use `pls player {nm}{yr} #N` or "
+                  f"`pls player {nm}{yr}, Team`.")
 
     # ------------------------------------------------------------ leaders
 
@@ -463,12 +516,8 @@ class League:
         f = lambda x: f"{x:.1f}"
         num = lambda x: "?" if x is None else str(int(round(x)))
 
-        if p["tid"] >= 0:
-            team = self.team_label(p["tid"])
-            cls = class_label(p)
-        else:
-            team = STATUS_LABELS.get(p["tid"], "?")
-            cls = None
+        team = self.team_or_status(p["tid"])
+        cls = class_label(p)
 
         jersey = f"#{p['jersey']}" if p["jersey"] not in (None, "") else None
         header = [p["name"], f"{num(r['ovr'])} OVR", cls, r.get("pos"), jersey, team]
@@ -494,7 +543,7 @@ class League:
                 f"{f(t['per'])} PER | {f(t['ewa'])} EWA | {f(t['ortg'])} ORTG | {f(t['drtg'])} DRTG",
             ]
         else:
-            lines.append(f"{self.season or ''} STATS: no games played".strip())
+            lines.append(f"{p['stat_season'] or self.season or ''} STATS: no games played".strip())
         lines.append("")
 
         hgt = p["hgt"]
@@ -694,7 +743,8 @@ async def leaders_cmd(ctx, stat: str = None, n: int = 10):
 
 
 HELP_TEXT = """**BBGM Bot commands**
-`pls player <First Last>`: player card with this season's stats and ratings
+`pls player <First Last> [year]`: player card with this season's stats and ratings
+  Add a year for a past season: `pls player John Smith 2025`
   Same name? Add `, Team` or `#N`: `pls player John Smith, Drake`
 `pls team <name>`: record and roster (region, nickname, or abbreviation)
 `pls log <team>`: this season's results
@@ -734,7 +784,7 @@ async def reload_cmd(ctx):
 
 
 USAGE = {
-    "player": "pls player FirstName LastName [, Team | #N]",
+    "player": "pls player FirstName LastName [YEAR] [, Team | #N]",
     "team": "pls team TeamName",
     "leaders": "pls leaders <stat> [count]",
     "log": "pls log TeamName",
