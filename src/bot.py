@@ -35,7 +35,7 @@ from discord.ext import commands
 STATE_FILE = Path(__file__).with_name("bot_state.json")
 CACHE_FILE = Path(__file__).with_name("league_cache.json")  # local copy of the last URL load
 
-CLASS_LABELS = {1: "Fr.", 2: "So.", 3: "Jr.", 4: "Sr."}
+CLASS_LABELS = {19: "Fr.", 20: "So.", 21: "Jr.", 22: "Sr."}  # by age; <=18 HS, 23+ LS
 STATUS_LABELS = {-1: "Free Agent", -2: "Recruit", -3: "Retired"}
 PT_LABELS = {0: "0", 0.75: "-", 1: "", 1.25: "+", 1.75: "++"}  # BBGM playing-time modifier
 MAX_MSG = 1900  # stay under Discord's 2000-char limit
@@ -143,25 +143,17 @@ def aggregate(rows):
     return t
 
 
-def class_years(reg_seasons, tid, current_season):
-    """Years in the program = distinct regular-season stat seasons, plus the
-    current season if they're rostered but haven't logged a stat row yet
-    (preseason). Swap this out if your dynasty stores class year elsewhere."""
-    years = len(reg_seasons)
-    if tid >= 0 and current_season and (not reg_seasons or reg_seasons[-1] < current_season):
-        years += 1
-    return years
-
-
 def class_label(p):
     if p["tid"] is None or p["tid"] < 0:
         return None
     age = p.get("age")
-    if age is not None and age <= 18:
+    if age is None:
+        return None
+    if age <= 18:
         return "HS"
-    if p["years"] > 4 or (age is not None and age >= 23):
-        return "LS"  # 5th-year senior
-    return CLASS_LABELS.get(p["years"])
+    if age >= 23:
+        return "LS"
+    return CLASS_LABELS[int(age)]
 
 
 def format_record(s):
@@ -211,7 +203,6 @@ def summarize(p, current_season):
         "hgt": p.get("hgt"),
         "weight": p.get("weight"),
         "jersey": jersey,
-        "years": class_years(seasons, tid, current_season),
         "born_year": born.get("year"),
         "age": current_season - born["year"] if current_season and born.get("year") else None,
         "injury": (p.get("injury") or {}).get("gamesRemaining", 0) or 0,
@@ -238,7 +229,6 @@ def season_view(p, year, current_season):
     v.update({
         "tid": tid,  # None: no team on record that season
         "jersey": h.get("jersey") or (p["jersey"] if year == current_season else None),
-        "years": class_years([s for s in p["seasons"] if s <= year], tid if tid is not None else -1, year),
         "age": year - p["born_year"] if p["born_year"] else None,
         "ratings": h["ratings"] or {k: None for k in RATING_KEYS},
         "stat_season": year,
