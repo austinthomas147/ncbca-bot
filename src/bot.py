@@ -144,7 +144,7 @@ def aggregate(rows):
 
 
 def class_label(p):
-    if p["tid"] is None or p["tid"] < 0:
+    if p["tid"] is None:
         return None
     age = p.get("age")
     if age is None:
